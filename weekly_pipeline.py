@@ -1,15 +1,20 @@
 """
-Weekly PM Discovery Pipeline
+Daily PM Discovery & Re-scan Pipeline
 
 Orchestrates:
-1. Scrape new property managers (appfolio-2 scraper, --new-only)
-2. Detect PM software for new domains (appfolio-tech pm_system_detector)
-3. Detect RBP offerings for new domains (appfolio-rbp-detection rbp_detector)
-4. Log all findings to weekly CSV + summary
+1. Seed DB from pm_results.csv (DB is gitignored, reconstructed each CI run)
+2. (Monday only) Scrape new property managers + detect PM software + RBP
+3. (Daily) Re-scan 1/8 of existing domains (full rotation every ~8 days)
+4. DNS recovery pass on unknowns
+5. Export DB back to pm_results.csv
+6. Snapshot/diff when a full rotation completes
+7. Log daily summary
 
 Usage:
-  python weekly_pipeline.py              # Full pipeline
-  python weekly_pipeline.py --skip-scrape  # Skip scraping, use existing new_property_managers.csv
+  python weekly_pipeline.py                  # Full pipeline (scrape if Monday + rescan chunk)
+  python weekly_pipeline.py --skip-scrape    # Skip scraping, use existing new_property_managers.csv
+  python weekly_pipeline.py --skip-rescan    # Skip chunk re-scan
+  python weekly_pipeline.py --skip-recovery  # Skip DNS recovery pass
 """
 
 import argparse
@@ -17,6 +22,7 @@ import csv
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 from collections import Counter
@@ -30,6 +36,7 @@ PM_DETECTION_DIR = os.path.join(PIPELINE_DIR, "pm_detection")
 RBP_DETECTION_DIR = os.path.join(PIPELINE_DIR, "rbp_detection")
 DATA_DIR = os.path.join(PIPELINE_DIR, "data")
 WEEKLY_LOGS_DIR = os.path.join(DATA_DIR, "weekly_logs")
+SNAPSHOTS_DIR = os.path.join(DATA_DIR, "snapshots")
 
 # Data files
 PROPERTY_MANAGERS_CSV = os.path.join(DATA_DIR, "property_managers.csv")
@@ -37,18 +44,29 @@ DOMAINS_DOORS_CSV = os.path.join(DATA_DIR, "domains_doors.csv")
 PM_RESULTS_CSV = os.path.join(DATA_DIR, "pm_results.csv")
 RBP_RESULTS_CSV = os.path.join(DATA_DIR, "rbp_results.csv")
 CUMULATIVE_STATS_JSON = os.path.join(WEEKLY_LOGS_DIR, "cumulative_stats.json")
+PIPELINE_STATE_JSON = os.path.join(DATA_DIR, "pipeline_state.json")
 
 # Intermediate files (gitignored)
 NEW_DOMAINS_CSV = os.path.join(DATA_DIR, "new_domains.csv")
 PM_RESULTS_NEW_CSV = os.path.join(DATA_DIR, "pm_results_new.csv")
 PM_RESULTS_FOR_RBP_CSV = os.path.join(DATA_DIR, "pm_results_for_rbp.csv")
+CHUNK_DOMAINS_CSV = os.path.join(DATA_DIR, "chunk_domains.csv")
+CHUNK_RESULTS_CSV = os.path.join(DATA_DIR, "chunk_results.csv")
 
 # Scraper files (relative to scraper cwd)
 SCRAPER_BASELINE = os.path.join(SCRAPER_DIR, "property_managers.csv")
 SCRAPER_NEW_OUTPUT = os.path.join(SCRAPER_DIR, "new_property_managers.csv")
 
+# DB path inside pm_detection/
+PM_DB_PATH = os.path.join(PM_DETECTION_DIR, "pm_system_results.db")
+RECOVERY_DB_PATH = os.path.join(PM_DETECTION_DIR, "pm_recovery_results.db")
+
 SCRAPE_TIMEOUT = 4 * 3600  # 4 hours
-DETECTION_TIMEOUT = 2 * 3600  # 2 hours
+DETECTION_TIMEOUT = 3 * 3600  # 3 hours (chunk can take a while)
+RECOVERY_TIMEOUT = 30 * 60  # 30 minutes
+
+# Rotation summary file (used by GitHub Actions to create an issue)
+ROTATION_SUMMARY_PATH = os.path.join(DATA_DIR, "rotation_summary.md")
 
 
 def log(msg):
@@ -103,6 +121,383 @@ def run_step(cmd, cwd, timeout, step_name):
         raise RuntimeError(f"{step_name} failed with exit code {proc.returncode}")
     log(f"{step_name} completed successfully.")
 
+
+# ---------------------------------------------------------------------------
+# State management
+# ---------------------------------------------------------------------------
+
+def load_state():
+    """Load pipeline state (chunk index, last run date, etc.)."""
+    if not os.path.exists(PIPELINE_STATE_JSON):
+        return {
+            "last_chunk_index": -1,
+            "last_run_date": None,
+            "last_snapshot_date": "2026-02-02",
+            "total_chunks": 8,
+        }
+    with open(PIPELINE_STATE_JSON, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_state(state):
+    """Persist pipeline state."""
+    with open(PIPELINE_STATE_JSON, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2)
+    log(f"State saved: chunk={state['last_chunk_index']}, date={state['last_run_date']}")
+
+
+# ---------------------------------------------------------------------------
+# DB seeding & export
+# ---------------------------------------------------------------------------
+
+def step_seed_db():
+    """Reconstruct SQLite DB from pm_results.csv so CI starts with full history."""
+    log("=" * 60)
+    log("STEP: Seed database from pm_results.csv")
+    log("=" * 60)
+
+    # Remove stale DB if present
+    if os.path.exists(PM_DB_PATH):
+        os.remove(PM_DB_PATH)
+    if os.path.exists(RECOVERY_DB_PATH):
+        os.remove(RECOVERY_DB_PATH)
+
+    rows = read_csv(PM_RESULTS_CSV)
+    if not rows:
+        log("WARNING: pm_results.csv is empty or missing — starting with empty DB")
+        return 0
+
+    conn = sqlite3.connect(PM_DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            domain TEXT UNIQUE,
+            portal_system TEXT,
+            portal_subdomain TEXT,
+            confidence TEXT,
+            detection_method TEXT,
+            validated INTEGER,
+            validation_website TEXT,
+            error TEXT,
+            timestamp TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_domain ON results(domain)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_portal_system ON results(portal_system)')
+
+    inserted = 0
+    for row in rows:
+        try:
+            cursor.execute('''
+                INSERT OR REPLACE INTO results
+                (domain, portal_system, portal_subdomain, confidence,
+                 detection_method, validated, validation_website,
+                 error, timestamp, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ''', (
+                row.get("domain", ""),
+                row.get("portal_system", ""),
+                row.get("portal_subdomain", ""),
+                row.get("confidence", ""),
+                row.get("detection_method", ""),
+                int(row.get("validated", 0)),
+                row.get("validation_website", ""),
+                row.get("error", ""),
+                row.get("timestamp", ""),
+            ))
+            inserted += 1
+        except Exception as e:
+            log(f"  Seed error for {row.get('domain', '?')}: {e}")
+
+    conn.commit()
+    conn.close()
+    log(f"Seeded DB with {inserted} domains from {PM_RESULTS_CSV}")
+    return inserted
+
+
+def step_export_db():
+    """Export SQLite DB back to pm_results.csv (overwrites)."""
+    log("=" * 60)
+    log("STEP: Export database to pm_results.csv")
+    log("=" * 60)
+
+    if not os.path.exists(PM_DB_PATH):
+        log("WARNING: No DB to export")
+        return
+
+    run_step(
+        [sys.executable, "pm_system_detector.py",
+         "export", PM_RESULTS_CSV,
+         "--db", "pm_system_results.db"],
+        cwd=PM_DETECTION_DIR,
+        timeout=60,
+        step_name="Export DB to CSV",
+    )
+
+    rows = read_csv(PM_RESULTS_CSV)
+    log(f"Exported {len(rows)} domains to {PM_RESULTS_CSV}")
+
+
+# ---------------------------------------------------------------------------
+# Chunked re-scan
+# ---------------------------------------------------------------------------
+
+def get_chunk_domains(chunk_index, total_chunks):
+    """Return domains for a given chunk (deterministic, alphabetically sorted)."""
+    rows = read_csv(PM_RESULTS_CSV)
+    all_domains = sorted(set(r.get("domain", "") for r in rows if r.get("domain")))
+
+    chunk_size = len(all_domains) // total_chunks
+    remainder = len(all_domains) % total_chunks
+
+    # Distribute remainder across first 'remainder' chunks
+    start = 0
+    for i in range(chunk_index):
+        start += chunk_size + (1 if i < remainder else 0)
+    end = start + chunk_size + (1 if chunk_index < remainder else 0)
+
+    chunk = all_domains[start:end]
+    log(f"Chunk {chunk_index}/{total_chunks}: domains {start}-{end-1} "
+        f"({len(chunk)} domains, total corpus: {len(all_domains)})")
+    return chunk
+
+
+def step_rescan_chunk(state):
+    """Re-scan one chunk of existing domains with --no-skip to force re-detection."""
+    total_chunks = state.get("total_chunks", 8)
+    chunk_index = (state["last_chunk_index"] + 1) % total_chunks
+
+    log("=" * 60)
+    log(f"STEP: Re-scan chunk {chunk_index}/{total_chunks}")
+    log("=" * 60)
+
+    domains = get_chunk_domains(chunk_index, total_chunks)
+    if not domains:
+        log("No domains in this chunk — skipping")
+        return chunk_index, 0
+
+    # Write chunk domains to temp CSV
+    write_csv(CHUNK_DOMAINS_CSV, [{"domain": d} for d in domains], ["domain"])
+
+    run_step(
+        [sys.executable, "pm_system_detector.py",
+         "batch", CHUNK_DOMAINS_CSV, CHUNK_RESULTS_CSV,
+         "--db", "pm_system_results.db",
+         "--no-skip"],
+        cwd=PM_DETECTION_DIR,
+        timeout=DETECTION_TIMEOUT,
+        step_name=f"Re-scan Chunk {chunk_index}",
+    )
+
+    results = read_csv(CHUNK_RESULTS_CSV)
+    unknowns = sum(1 for r in results if r.get("portal_system") == "unknown")
+    detected = len(results) - unknowns
+    log(f"Chunk {chunk_index} complete: {len(results)} domains "
+        f"({detected} detected, {unknowns} unknown)")
+
+    return chunk_index, len(domains)
+
+
+# ---------------------------------------------------------------------------
+# DNS recovery
+# ---------------------------------------------------------------------------
+
+def step_dns_recovery():
+    """Run DNS-based recovery strategies on unknown domains in the DB."""
+    log("=" * 60)
+    log("STEP: DNS recovery for unknown domains")
+    log("=" * 60)
+
+    if not os.path.exists(PM_DB_PATH):
+        log("No DB found — skipping recovery")
+        return 0
+
+    # Count unknowns in DB
+    conn = sqlite3.connect(PM_DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM results WHERE portal_system = 'unknown'")
+    unknowns = cursor.fetchone()[0]
+    conn.close()
+
+    if unknowns == 0:
+        log("No unknown domains — skipping recovery")
+        return 0
+
+    log(f"Found {unknowns} unknown domains, running DNS recovery (strategies 2,6)")
+
+    run_step(
+        [sys.executable, "pm_unknown_recovery.py",
+         "run", "--strategies", "2,6",
+         "--main-db", "pm_system_results.db",
+         "--db", "pm_recovery_results.db"],
+        cwd=PM_DETECTION_DIR,
+        timeout=RECOVERY_TIMEOUT,
+        step_name="DNS Recovery",
+    )
+
+    # Consolidate recoveries back into main DB
+    run_step(
+        [sys.executable, "pm_unknown_recovery.py",
+         "consolidate",
+         "--main-db", "pm_system_results.db",
+         "--db", "pm_recovery_results.db"],
+        cwd=PM_DETECTION_DIR,
+        timeout=60,
+        step_name="Consolidate Recovery",
+    )
+
+    # Count unknowns after recovery
+    conn = sqlite3.connect(PM_DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM results WHERE portal_system = 'unknown'")
+    new_unknowns = cursor.fetchone()[0]
+    conn.close()
+
+    recovered = unknowns - new_unknowns
+    log(f"DNS recovery: {recovered} recovered ({new_unknowns} still unknown)")
+    return recovered
+
+
+# ---------------------------------------------------------------------------
+# Snapshot & diff on rotation completion
+# ---------------------------------------------------------------------------
+
+def step_snapshot_if_rotation_complete(chunk_index, state):
+    """Take a snapshot and diff when the chunk rotation wraps back to 0."""
+    if chunk_index != 0:
+        return False
+
+    # First run (last_chunk_index was -1) — don't snapshot
+    if state.get("last_chunk_index", -1) == -1:
+        log("First rotation starting — skipping snapshot")
+        return False
+
+    log("=" * 60)
+    log("STEP: Full rotation complete — taking snapshot and diffing")
+    log("=" * 60)
+
+    today = date.today().isoformat()
+    os.makedirs(SNAPSHOTS_DIR, exist_ok=True)
+    snapshot_path = os.path.join(SNAPSHOTS_DIR, f"snapshot_{today}.csv")
+
+    # Take snapshot via detector CLI
+    run_step(
+        [sys.executable, "pm_system_detector.py",
+         "snapshot", snapshot_path,
+         "--db", "pm_system_results.db"],
+        cwd=PM_DETECTION_DIR,
+        timeout=60,
+        step_name="Take Snapshot",
+    )
+
+    # Find previous snapshot to diff against
+    prev_snapshot_date = state.get("last_snapshot_date", "2026-02-02")
+    prev_snapshot = os.path.join(SNAPSHOTS_DIR, f"snapshot_{prev_snapshot_date}_clean.csv")
+    if not os.path.exists(prev_snapshot):
+        prev_snapshot = os.path.join(SNAPSHOTS_DIR, f"snapshot_{prev_snapshot_date}.csv")
+
+    if os.path.exists(prev_snapshot):
+        log(f"Diffing against previous snapshot: {prev_snapshot}")
+
+        # Run diff and capture output for the issue
+        diff_output_csv = os.path.join(SNAPSHOTS_DIR, f"diff_{prev_snapshot_date}_to_{today}.csv")
+        proc = subprocess.run(
+            [sys.executable, "pm_system_detector.py",
+             "diff", prev_snapshot,
+             "--db", "pm_system_results.db",
+             "--output", diff_output_csv],
+            cwd=PM_DETECTION_DIR,
+            timeout=60,
+            capture_output=True,
+            text=True,
+        )
+
+        diff_report = proc.stdout if proc.stdout else "No diff output captured."
+        log(f"Diff complete. Report saved to {diff_output_csv}")
+
+        # Write rotation summary for GitHub Issue
+        _write_rotation_summary(today, prev_snapshot_date, diff_report, diff_output_csv)
+    else:
+        log(f"No previous snapshot found at {prev_snapshot} — skipping diff")
+
+    # Update state with new snapshot date
+    state["last_snapshot_date"] = today
+    log(f"Snapshot saved: {snapshot_path}")
+    return True
+
+
+def _write_rotation_summary(today, prev_date, diff_report, diff_csv_path):
+    """Write a markdown summary file for the GitHub Issue."""
+    # Read the diff CSV if it exists for structured data
+    changes = read_csv(diff_csv_path) if os.path.exists(diff_csv_path) else []
+
+    switches = [c for c in changes if c.get("change_type") == "switch"]
+    new_detections = [c for c in changes if c.get("change_type") == "new_detection"]
+    lost_detections = [c for c in changes if c.get("change_type") == "lost_detection"]
+
+    lines = [
+        f"## PM Software Detection - Full Rotation Report",
+        f"",
+        f"**Period:** {prev_date} to {today}",
+        f"**Changes detected:** {len(changes)}",
+        f"",
+        f"### Summary",
+        f"- PM system switches: {len(switches)}",
+        f"- New detections (unknown -> known): {len(new_detections)}",
+        f"- Lost detections (known -> unknown): {len(lost_detections)}",
+        f"",
+    ]
+
+    if switches:
+        lines.append("### PM System Switches")
+        lines.append("| Domain | Doors | From | To |")
+        lines.append("|--------|-------|------|----|")
+        for s in sorted(switches, key=lambda x: -int(x.get("doors", 0) or 0))[:20]:
+            lines.append(f"| {s['domain']} | {s.get('doors', '?')} | {s['previous']} | {s['current']} |")
+        if len(switches) > 20:
+            lines.append(f"| ... | | | ({len(switches) - 20} more) |")
+        lines.append("")
+
+    if new_detections:
+        lines.append("### New Detections")
+        lines.append("| Domain | Doors | Detected As |")
+        lines.append("|--------|-------|-------------|")
+        for s in sorted(new_detections, key=lambda x: -int(x.get("doors", 0) or 0))[:20]:
+            lines.append(f"| {s['domain']} | {s.get('doors', '?')} | {s['current']} |")
+        if len(new_detections) > 20:
+            lines.append(f"| ... | | ({len(new_detections) - 20} more) |")
+        lines.append("")
+
+    if lost_detections:
+        lines.append("### Lost Detections")
+        lines.append("| Domain | Doors | Was |")
+        lines.append("|--------|-------|-----|")
+        for s in sorted(lost_detections, key=lambda x: -int(x.get("doors", 0) or 0))[:20]:
+            lines.append(f"| {s['domain']} | {s.get('doors', '?')} | {s['previous']} |")
+        if len(lost_detections) > 20:
+            lines.append(f"| ... | | ({len(lost_detections) - 20} more) |")
+        lines.append("")
+
+    # Append the raw diff report text
+    lines.append("<details><summary>Full diff report</summary>")
+    lines.append("")
+    lines.append("```")
+    lines.append(diff_report.strip())
+    lines.append("```")
+    lines.append("</details>")
+
+    with open(ROTATION_SUMMARY_PATH, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    log(f"Wrote rotation summary: {ROTATION_SUMMARY_PATH}")
+
+
+# ---------------------------------------------------------------------------
+# Existing pipeline steps (scrape, process, detect new, RBP)
+# ---------------------------------------------------------------------------
 
 def step_scrape():
     """Step 1: Copy baseline and run scraper --new-only."""
@@ -185,10 +580,10 @@ def step_process(new_pms):
     return new_domains
 
 
-def step_pm_detection():
-    """Step 3: Run PM software detection on new domains."""
+def step_pm_detection_new():
+    """Detect PM software for newly discovered domains (DB already seeded)."""
     log("=" * 60)
-    log("STEP 3: Detect PM software for new domains")
+    log("STEP: Detect PM software for new domains")
     log("=" * 60)
 
     run_step(
@@ -198,67 +593,14 @@ def step_pm_detection():
          "--no-playwright"],
         cwd=PM_DETECTION_DIR,
         timeout=DETECTION_TIMEOUT,
-        step_name="PM Detection",
+        step_name="PM Detection (new)",
     )
 
-    # Read initial detection results
     pm_results = read_csv(PM_RESULTS_NEW_CSV)
     unknowns = sum(1 for r in pm_results if r.get("portal_system") == "unknown")
-    log(f"PM detection completed for {len(pm_results)} domains ({unknowns} unknown).")
+    log(f"PM detection completed for {len(pm_results)} new domains ({unknowns} unknown).")
 
-    # Step 3.5: DNS recovery for unknowns (strategies 2=CNAME, 6=SPF/MX/TXT)
-    if unknowns > 0:
-        log("-" * 40)
-        log(f"STEP 3.5: DNS recovery for {unknowns} unknown domains")
-        log("-" * 40)
-        pm_db = os.path.join(PM_DETECTION_DIR, "pm_system_results.db")
-        recovery_db = os.path.join(PM_DETECTION_DIR, "pm_recovery_results.db")
-
-        run_step(
-            [sys.executable, "pm_unknown_recovery.py",
-             "run", "--strategies", "2,6",
-             "--main-db", "pm_system_results.db",
-             "--db", "pm_recovery_results.db"],
-            cwd=PM_DETECTION_DIR,
-            timeout=DETECTION_TIMEOUT,
-            step_name="DNS Recovery",
-        )
-
-        # Consolidate recoveries back into main DB
-        run_step(
-            [sys.executable, "pm_unknown_recovery.py",
-             "consolidate",
-             "--main-db", "pm_system_results.db",
-             "--db", "pm_recovery_results.db"],
-            cwd=PM_DETECTION_DIR,
-            timeout=60,
-            step_name="Consolidate Recovery",
-        )
-
-        # Re-export to pick up recovered domains
-        run_step(
-            [sys.executable, "pm_system_detector.py",
-             "export", PM_RESULTS_NEW_CSV,
-             "--db", "pm_system_results.db"],
-            cwd=PM_DETECTION_DIR,
-            timeout=60,
-            step_name="Re-export PM Results",
-        )
-        pm_results = read_csv(PM_RESULTS_NEW_CSV)
-        new_unknowns = sum(1 for r in pm_results if r.get("portal_system") == "unknown")
-        recovered = unknowns - new_unknowns
-        log(f"DNS recovery recovered {recovered} domains ({new_unknowns} still unknown).")
-
-    # Append new results to the cumulative pm_results.csv
-    if pm_results and os.path.exists(PM_RESULTS_CSV):
-        pm_fieldnames = list(pm_results[0].keys())
-        with open(PM_RESULTS_CSV, "a", encoding="utf-8", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=pm_fieldnames)
-            for row in pm_results:
-                writer.writerow(row)
-        log(f"Appended {len(pm_results)} results to cumulative {PM_RESULTS_CSV}")
-
-    # Prepare input for RBP detection: need domain, portal_system, portal_subdomain
+    # Prepare input for RBP detection
     rbp_input = []
     for row in pm_results:
         rbp_input.append({
@@ -273,9 +615,9 @@ def step_pm_detection():
 
 
 def step_rbp_detection():
-    """Step 4: Run RBP detection on newly PM-detected domains."""
+    """Run RBP detection on newly PM-detected domains."""
     log("=" * 60)
-    log("STEP 4: Detect RBP offerings for new domains")
+    log("STEP: Detect RBP offerings for new domains")
     log("=" * 60)
 
     run_step(
@@ -298,7 +640,6 @@ def step_rbp_detection():
 
     # Read back the new domains' RBP results
     all_rbp = read_csv(rbp_export_path)
-    # Filter to just the domains we processed this week
     new_domain_set = set(row["domain"] for row in read_csv(PM_RESULTS_FOR_RBP_CSV))
     rbp_results = [r for r in all_rbp if r.get("domain") in new_domain_set]
     log(f"RBP detection completed. {len(rbp_results)} results for new domains.")
@@ -317,6 +658,10 @@ def step_rbp_detection():
 
     return rbp_results
 
+
+# ---------------------------------------------------------------------------
+# Logging helpers
+# ---------------------------------------------------------------------------
 
 def compute_rbp_stats(rbp_rows):
     """Compute RBP statistics from a list of RBP result dicts."""
@@ -386,10 +731,10 @@ def fmt_delta(current, previous, is_pct=False):
     return f"{current} ({sign}{diff})"
 
 
-def step_log(new_pms, new_domains, pm_results, rbp_results):
-    """Step 5: Write weekly log CSV and summary."""
+def step_log(new_pms, new_domains, pm_results, rbp_results, chunk_info=None):
+    """Write daily log CSV and summary."""
     log("=" * 60)
-    log("STEP 5: Generate weekly log")
+    log("STEP: Generate daily log")
     log("=" * 60)
 
     today = date.today().isoformat()
@@ -427,9 +772,9 @@ def step_log(new_pms, new_domains, pm_results, rbp_results):
         })
 
     write_csv(log_csv_path, log_rows, log_fieldnames)
-    log(f"Wrote weekly log: {log_csv_path} ({len(log_rows)} rows)")
+    log(f"Wrote daily log: {log_csv_path} ({len(log_rows)} rows)")
 
-    # --- This Week's New PMs Summary ---
+    # --- Summary ---
     with_website = len(new_domains)
     pm_detected = sum(1 for r in pm_results if r.get("portal_system") and r.get("portal_system") != "unknown")
     new_rbp_offered = sum(1 for r in rbp_results if str(r.get("rbp_offered", "0")) == "1")
@@ -441,21 +786,37 @@ def step_log(new_pms, new_domains, pm_results, rbp_results):
             pm_systems[system] += 1
 
     summary_lines = [
-        f"Weekly Pipeline Report: {today}",
+        f"Daily Pipeline Report: {today}",
         "=" * 60,
-        "",
-        "THIS WEEK'S NEW PMs",
-        "-" * 40,
-        f"New property managers found: {len(new_pms)}",
-        f"  With website: {with_website}",
-        f"  PM software detected: {pm_detected}",
-        f"  RBP offered: {new_rbp_offered}",
     ]
 
-    if pm_systems:
-        summary_lines.append("  PM System Breakdown:")
-        for system, count in pm_systems.most_common():
-            summary_lines.append(f"    {system}: {count}")
+    # Chunk re-scan info
+    if chunk_info:
+        summary_lines.extend([
+            "",
+            "CHUNK RE-SCAN",
+            "-" * 40,
+            f"Chunk: {chunk_info['chunk_index']}/{chunk_info['total_chunks']}",
+            f"Domains re-scanned: {chunk_info['domains_rescanned']}",
+            f"DNS recovered: {chunk_info.get('dns_recovered', 0)}",
+            f"Rotation complete: {'Yes' if chunk_info.get('rotation_complete') else 'No'}",
+        ])
+
+    # New PMs section (Monday runs)
+    if new_pms or new_domains:
+        summary_lines.extend([
+            "",
+            "NEW PMs DISCOVERED",
+            "-" * 40,
+            f"New property managers found: {len(new_pms)}",
+            f"  With website: {with_website}",
+            f"  PM software detected: {pm_detected}",
+            f"  RBP offered: {new_rbp_offered}",
+        ])
+        if pm_systems:
+            summary_lines.append("  PM System Breakdown:")
+            for system, count in pm_systems.most_common():
+                summary_lines.append(f"    {system}: {count}")
 
     # --- Database-Wide RBP Summary ---
     summary_lines.extend(["", ""])
@@ -501,9 +862,9 @@ def step_log(new_pms, new_domains, pm_results, rbp_results):
 
     if prev_stats:
         prev_week = prev_stats.get("week", "unknown")
-        summary_lines.extend(["", f"(Deltas vs. previous week: {prev_week})"])
+        summary_lines.extend(["", f"(Deltas vs. previous run: {prev_week})"])
 
-    # Save current stats for next week
+    # Save current stats for next run
     save_cumulative_stats(curr_stats, today)
 
     summary_text = "\n".join(summary_lines) + "\n"
@@ -532,7 +893,7 @@ def write_empty_log(reason="No new property managers found"):
     write_csv(log_csv_path, [], log_fieldnames)
 
     summary_text = (
-        f"Weekly Pipeline Report: {today}\n"
+        f"Daily Pipeline Report: {today}\n"
         f"{'=' * 50}\n"
         f"{reason}\n"
         f"No further processing needed.\n"
@@ -544,51 +905,121 @@ def write_empty_log(reason="No new property managers found"):
     print(summary_text)
 
 
+# ---------------------------------------------------------------------------
+# Main orchestration
+# ---------------------------------------------------------------------------
+
 def main():
-    parser = argparse.ArgumentParser(description="Weekly PM Discovery Pipeline")
+    parser = argparse.ArgumentParser(description="Daily PM Discovery & Re-scan Pipeline")
     parser.add_argument(
         "--skip-scrape",
         action="store_true",
         help="Skip scraping step; use existing scraper/new_property_managers.csv",
     )
+    parser.add_argument(
+        "--skip-rescan",
+        action="store_true",
+        help="Skip the chunk re-scan of existing domains",
+    )
+    parser.add_argument(
+        "--skip-recovery",
+        action="store_true",
+        help="Skip DNS recovery pass",
+    )
     args = parser.parse_args()
 
-    log(f"Pipeline started: {date.today().isoformat()}")
+    today = date.today()
+    is_monday = today.weekday() == 0
+    today_str = today.isoformat()
+
+    log(f"Pipeline started: {today_str} ({'Monday' if is_monday else today.strftime('%A')})")
     log(f"Pipeline dir: {PIPELINE_DIR}")
 
-    # Step 1: Scrape (or load existing)
-    if args.skip_scrape:
-        log("Skipping scrape (--skip-scrape). Loading existing new PMs...")
-        if not os.path.exists(SCRAPER_NEW_OUTPUT):
-            log(f"ERROR: {SCRAPER_NEW_OUTPUT} not found. Cannot skip scrape without it.")
-            sys.exit(1)
-        new_pms = read_csv(SCRAPER_NEW_OUTPUT)
-        log(f"Loaded {len(new_pms)} PMs from {SCRAPER_NEW_OUTPUT}")
-    else:
+    # 1. Load state
+    state = load_state()
+    log(f"State: chunk={state['last_chunk_index']}, "
+        f"last_run={state['last_run_date']}, "
+        f"chunks={state['total_chunks']}")
+
+    # 2. Seed DB from pm_results.csv
+    step_seed_db()
+
+    # 3. Monday: Scrape new PMs + detect + process
+    new_pms = []
+    new_domains = []
+    pm_results_new = []
+    rbp_results = []
+
+    if is_monday and not args.skip_scrape:
         new_pms = step_scrape()
+        if new_pms:
+            new_domains = step_process(new_pms)
+            if new_domains:
+                pm_results_new = step_pm_detection_new()
+    elif is_monday and args.skip_scrape:
+        log("Monday but --skip-scrape set. Checking for existing new PMs...")
+        if os.path.exists(SCRAPER_NEW_OUTPUT):
+            new_pms = read_csv(SCRAPER_NEW_OUTPUT)
+            log(f"Loaded {len(new_pms)} PMs from {SCRAPER_NEW_OUTPUT}")
+            if new_pms:
+                new_domains = step_process(new_pms)
+                if new_domains:
+                    pm_results_new = step_pm_detection_new()
+        else:
+            log("No existing new_property_managers.csv found.")
+    else:
+        log("Not Monday — skipping new PM scraping")
 
-    # Early exit if no new PMs
-    if not new_pms:
-        write_empty_log()
-        log("Pipeline complete (no new PMs).")
-        return
+    # 4. Daily: Re-scan chunk of existing domains
+    chunk_index = None
+    domains_rescanned = 0
+    if not args.skip_rescan:
+        chunk_index, domains_rescanned = step_rescan_chunk(state)
+    else:
+        log("Skipping chunk re-scan (--skip-rescan)")
 
-    # Step 2: Process new PMs, extract domains
-    new_domains = step_process(new_pms)
+    # 5. DNS recovery on unknowns
+    dns_recovered = 0
+    if not args.skip_recovery:
+        dns_recovered = step_dns_recovery()
+    else:
+        log("Skipping DNS recovery (--skip-recovery)")
 
-    if not new_domains:
-        write_empty_log("New PMs found but none had websites")
-        log("Pipeline complete (no domains to process).")
-        return
+    # 6. Export DB back to pm_results.csv
+    step_export_db()
 
-    # Step 3: PM software detection
-    pm_results = step_pm_detection()
+    # 7. Monday + new domains: RBP detection
+    if is_monday and new_domains and pm_results_new:
+        rbp_results = step_rbp_detection()
 
-    # Step 4: RBP detection
-    rbp_results = step_rbp_detection()
+    # 8. Snapshot/diff if rotation complete
+    rotation_complete = False
+    if chunk_index is not None:
+        rotation_complete = step_snapshot_if_rotation_complete(chunk_index, state)
 
-    # Step 5: Generate weekly log
-    step_log(new_pms, new_domains, pm_results, rbp_results)
+    # 9. Generate daily log
+    chunk_info = None
+    if chunk_index is not None:
+        chunk_info = {
+            "chunk_index": chunk_index,
+            "total_chunks": state["total_chunks"],
+            "domains_rescanned": domains_rescanned,
+            "dns_recovered": dns_recovered,
+            "rotation_complete": rotation_complete,
+        }
+
+    step_log(new_pms, new_domains, pm_results_new, rbp_results, chunk_info=chunk_info)
+
+    # 10. Save state
+    if chunk_index is not None:
+        state["last_chunk_index"] = chunk_index
+    state["last_run_date"] = today_str
+    save_state(state)
+
+    # Clean up intermediate files
+    for f in [CHUNK_DOMAINS_CSV, CHUNK_RESULTS_CSV]:
+        if os.path.exists(f):
+            os.remove(f)
 
     log("Pipeline complete!")
 

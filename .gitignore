@@ -18,6 +18,9 @@ scraper/scraper_progress_new_only.json
 data/new_domains.csv
 data/pm_results_new.csv
 data/pm_results_for_rbp.csv
+data/chunk_domains.csv
+data/chunk_results.csv
+data/rotation_summary.md
 
 # Logs
 *.log
