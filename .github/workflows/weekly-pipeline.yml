@@ -30,6 +30,22 @@ jobs:
       - name: Run weekly pipeline
         run: python weekly_pipeline.py
 
+      - name: Read summary
+        id: summary
+        if: always()
+        run: |
+          TODAY=$(date +%Y-%m-%d)
+          SUMMARY_FILE="data/weekly_logs/weekly_${TODAY}_summary.txt"
+          if [ -f "$SUMMARY_FILE" ]; then
+            {
+              echo "text<<SUMMARY_EOF"
+              cat "$SUMMARY_FILE"
+              echo "SUMMARY_EOF"
+            } >> $GITHUB_OUTPUT
+          else
+            echo "text=Pipeline ran but no summary file was generated." >> $GITHUB_OUTPUT
+          fi
+
       - name: Check for changes
         id: changes
         run: |
@@ -58,3 +74,20 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git commit -m "Weekly pipeline: $(date +%Y-%m-%d) - ${{ steps.changes.outputs.new_count }} new PMs"
           git push
+
+      - name: Send email summary
+        if: always()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.office365.com
+          server_port: 587
+          username: ${{ secrets.OUTLOOK_EMAIL }}
+          password: ${{ secrets.OUTLOOK_PASSWORD }}
+          subject: "PM Pipeline ${{ job.status }} — ${{ steps.changes.outputs.new_count || '0' }} new PMs (${{ github.run_id }})"
+          to: ${{ secrets.OUTLOOK_EMAIL }}
+          from: ${{ secrets.OUTLOOK_EMAIL }}
+          body: |
+            Status: ${{ job.status }}
+            Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            ${{ steps.summary.outputs.text }}
