@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Databases (ephemeral per CI run, seeded from committed data)
+*.db
+
+# Scraper working files (cwd = scraper/)
+scraper/property_managers.csv
+scraper/property_managers_partial.csv
+scraper/new_property_managers.csv
+scraper/new_property_managers_partial.csv
+scraper/scraper_progress.json
+scraper/scraper_progress_new_only.json
+
+# Intermediate pipeline files
+data/new_domains.csv
+data/pm_results_new.csv
+data/pm_results_for_rbp.csv
+
+# Logs
+*.log

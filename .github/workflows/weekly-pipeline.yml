@@ -1,0 +1,60 @@
+name: Weekly PM Discovery Pipeline
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'  # Monday 6 AM UTC
+  workflow_dispatch:
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Setup Chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run weekly pipeline
+        run: python weekly_pipeline.py
+
+      - name: Check for changes
+        id: changes
+        run: |
+          git add -A
+          if git diff --cached --quiet; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            NEW_COUNT=$(python -c "
+          import csv, os, datetime
+          today = datetime.date.today().isoformat()
+          log = f'data/weekly_logs/weekly_{today}.csv'
+          if os.path.exists(log):
+              with open(log) as f:
+                  print(sum(1 for _ in csv.reader(f)) - 1)
+          else:
+              print(0)
+          ")
+            echo "new_count=$NEW_COUNT" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Commit and push
+        if: steps.changes.outputs.has_changes == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -m "Weekly pipeline: $(date +%Y-%m-%d) - ${{ steps.changes.outputs.new_count }} new PMs"
+          git push
