@@ -56,36 +56,37 @@ jobs:
           fi
           python weekly_pipeline.py $FLAGS
 
-      - name: Prepare summary for issue
+      - name: Read summary for GitHub Issue
         id: summary
-        if: always()
         run: |
-          TODAY=$(date +%Y-%m-%d)
-          SUMMARY_FILE="data/weekly_logs/weekly_${TODAY}_summary.txt"
-          if [ -f "$SUMMARY_FILE" ]; then
+          if [ -f daily_summary_title.txt ]; then
             echo "has_summary=true" >> $GITHUB_OUTPUT
-            echo "title=PM Pipeline Report: ${TODAY}" >> $GITHUB_OUTPUT
-            {
-              echo '```'
-              cat "$SUMMARY_FILE"
-              echo '```'
-              echo ""
-              echo "**Run:** https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-              echo "**Status:** ${{ steps.pipeline.outcome }}"
-            } > pipeline_summary.md
+            TITLE=$(cat daily_summary_title.txt)
+            echo "title=$TITLE" >> $GITHUB_OUTPUT
           else
             echo "has_summary=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Create summary issue
+      - name: Create GitHub Issue with daily summary
         if: steps.summary.outputs.has_summary == 'true'
         uses: peter-evans/create-issue-from-file@v5
         with:
           title: ${{ steps.summary.outputs.title }}
-          content-filepath: ./pipeline_summary.md
+          content-filepath: ./daily_summary.md
           labels: |
             automated
             pm-pipeline
+
+      - name: Create rotation report issue
+        if: hashFiles('data/rotation_summary.md') != ''
+        uses: peter-evans/create-issue-from-file@v5
+        with:
+          title: "PM Detection Rotation Report - ${{ steps.summary.outputs.title }}"
+          content-filepath: data/rotation_summary.md
+          labels: |
+            automated
+            pm-detection
+            rotation-report
 
       - name: Read pipeline state for commit message
         id: state
@@ -102,44 +103,21 @@ jobs:
           ")
           echo "chunk_info=$CHUNK_INFO" >> $GITHUB_OUTPUT
 
-          echo "today=$(date +%Y-%m-%d)" >> $GITHUB_OUTPUT
-
-          # Check if rotation summary exists (rotation completed)
-          if [ -f "data/rotation_summary.md" ]; then
-            echo "rotation_complete=true" >> $GITHUB_OUTPUT
-          else
-            echo "rotation_complete=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Check for changes
-        id: changes
-        run: |
-          # Clean up temp file before staging
-          rm -f pipeline_summary.md
-          git add -A
-          if git diff --cached --quiet; then
-            echo "has_changes=false" >> $GITHUB_OUTPUT
-          else
-            echo "has_changes=true" >> $GITHUB_OUTPUT
-          fi
-
       - name: Commit and push
-        if: steps.changes.outputs.has_changes == 'true'
         run: |
+          # Remove temporary summary files before commit
+          rm -f daily_summary.md daily_summary_title.txt
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git commit -m "Daily pipeline: $(date +%Y-%m-%d) - ${{ steps.state.outputs.chunk_info }}"
-          git push
+          git add -A
 
-      - name: Create rotation report issue
-        if: steps.state.outputs.rotation_complete == 'true'
-        uses: peter-evans/create-issue-from-file@v5
-        with:
-          title: "PM Detection Rotation Report - ${{ steps.state.outputs.today }}"
-          content-filepath: data/rotation_summary.md
-          labels: |
-            automated
-            pm-detection
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Daily pipeline: $(date +%Y-%m-%d) - ${{ steps.state.outputs.chunk_info }}"
+            git push
+          fi
 
       - name: Fail if pipeline failed
         if: steps.pipeline.outcome == 'failure'

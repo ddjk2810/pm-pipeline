@@ -65,7 +65,9 @@ SCRAPE_TIMEOUT = 4 * 3600  # 4 hours
 DETECTION_TIMEOUT = 3 * 3600  # 3 hours (chunk can take a while)
 RECOVERY_TIMEOUT = 30 * 60  # 30 minutes
 
-# Rotation summary file (used by GitHub Actions to create an issue)
+# Summary files for GitHub Issues (gitignored, read by workflow before commit)
+ISSUE_SUMMARY_PATH = os.path.join(PIPELINE_DIR, "daily_summary.md")
+ISSUE_TITLE_PATH = os.path.join(PIPELINE_DIR, "daily_summary_title.txt")
 ROTATION_SUMMARY_PATH = os.path.join(DATA_DIR, "rotation_summary.md")
 
 
@@ -240,6 +242,31 @@ def step_export_db():
 
     rows = read_csv(PM_RESULTS_CSV)
     log(f"Exported {len(rows)} domains to {PM_RESULTS_CSV}")
+
+
+def _get_db_stats():
+    """Get high-level DB stats for the issue summary."""
+    if not os.path.exists(PM_DB_PATH):
+        return None
+    try:
+        conn = sqlite3.connect(PM_DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM results")
+        total = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM results WHERE portal_system != 'unknown' AND portal_system NOT LIKE 'custom:%'")
+        known = cursor.fetchone()[0]
+        cursor.execute("SELECT portal_system, COUNT(*) FROM results GROUP BY portal_system")
+        by_system = {row[0]: row[1] for row in cursor.fetchall()}
+        conn.close()
+        return {
+            "total": total,
+            "known": known,
+            "unknown": by_system.get("unknown", 0),
+            "by_system": by_system,
+        }
+    except Exception as e:
+        log(f"Warning: could not get DB stats: {e}")
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -731,6 +758,105 @@ def fmt_delta(current, previous, is_pct=False):
     return f"{current} ({sign}{diff})"
 
 
+def _write_issue_summary(today, chunk_info, new_pms, new_domains, pm_results,
+                         rbp_results, db_stats):
+    """Write GitHub Issue markdown summary + title file."""
+    is_monday = date.today().weekday() == 0
+    day_name = date.today().strftime("%A")
+
+    # Title
+    parts = [f"PM Pipeline: {today}"]
+    if chunk_info:
+        parts.append(f"chunk {chunk_info['chunk_index']}/{chunk_info['total_chunks']}")
+    if new_pms:
+        parts.append(f"{len(new_pms)} new PMs")
+    if chunk_info and chunk_info.get("rotation_complete"):
+        parts.append("ROTATION COMPLETE")
+    title = " - ".join(parts)
+
+    with open(ISSUE_TITLE_PATH, "w", encoding="utf-8") as f:
+        f.write(title)
+
+    # Body
+    lines = []
+
+    # Chunk progress section
+    if chunk_info:
+        idx = chunk_info["chunk_index"]
+        total = chunk_info["total_chunks"]
+        rescanned = chunk_info["domains_rescanned"]
+        recovered = chunk_info.get("dns_recovered", 0)
+        rotation = chunk_info.get("rotation_complete", False)
+
+        progress = "".join(
+            ":green_square:" if i < idx else
+            ":blue_square:" if i == idx else
+            ":white_large_square:"
+            for i in range(total)
+        )
+        lines.append(f"### Chunk Re-scan")
+        lines.append(f"{progress} **{idx}/{total}**")
+        lines.append(f"- Domains re-scanned: **{rescanned:,}**")
+        lines.append(f"- DNS recovered: **{recovered}**")
+        if rotation:
+            lines.append(f"- :tada: **Full rotation complete** — snapshot & diff generated")
+        lines.append("")
+
+    # New PMs (Monday only)
+    if new_pms:
+        with_website = len(new_domains)
+        pm_detected = sum(1 for r in pm_results
+                          if r.get("portal_system") and r.get("portal_system") != "unknown")
+        lines.append("### New PMs Discovered")
+        lines.append(f"| Metric | Count |")
+        lines.append(f"|--------|-------|")
+        lines.append(f"| New PMs found | {len(new_pms)} |")
+        lines.append(f"| With website | {with_website} |")
+        lines.append(f"| PM software detected | {pm_detected} |")
+        lines.append("")
+
+        pm_systems = Counter()
+        for r in pm_results:
+            system = r.get("portal_system", "unknown")
+            if system and system != "unknown":
+                pm_systems[system] += 1
+        if pm_systems:
+            lines.append("**PM System Breakdown:**")
+            for system, count in pm_systems.most_common():
+                lines.append(f"- {system}: {count}")
+            lines.append("")
+
+    # DB-wide stats
+    if db_stats:
+        total_domains = db_stats.get("total", 0)
+        known = db_stats.get("known", 0)
+        unknown = db_stats.get("unknown", 0)
+        detection_rate = round(100 * known / total_domains, 1) if total_domains else 0
+
+        lines.append("### Database Summary")
+        lines.append(f"| Metric | Value |")
+        lines.append(f"|--------|-------|")
+        lines.append(f"| Total domains | {total_domains:,} |")
+        lines.append(f"| Detected (known PM) | {known:,} ({detection_rate}%) |")
+        lines.append(f"| Unknown | {unknown:,} |")
+
+        # Top PM systems
+        by_system = db_stats.get("by_system", {})
+        if by_system:
+            lines.append("")
+            lines.append("**Market share:**")
+            lines.append("| PM System | Count |")
+            lines.append("|-----------|-------|")
+            for system, count in sorted(by_system.items(), key=lambda x: -x[1]):
+                if system not in ("unknown",) and not system.startswith("custom:"):
+                    lines.append(f"| {system} | {count:,} |")
+        lines.append("")
+
+    with open(ISSUE_SUMMARY_PATH, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    log(f"Wrote issue summary: {ISSUE_SUMMARY_PATH}")
+
+
 def step_log(new_pms, new_domains, pm_results, rbp_results, chunk_info=None):
     """Write daily log CSV and summary."""
     log("=" * 60)
@@ -1010,7 +1136,12 @@ def main():
 
     step_log(new_pms, new_domains, pm_results_new, rbp_results, chunk_info=chunk_info)
 
-    # 10. Save state
+    # 10. Write GitHub Issue summary
+    db_stats = _get_db_stats()
+    _write_issue_summary(today_str, chunk_info, new_pms, new_domains,
+                         pm_results_new, rbp_results, db_stats)
+
+    # 11. Save state
     if chunk_index is not None:
         state["last_chunk_index"] = chunk_index
     state["last_run_date"] = today_str
