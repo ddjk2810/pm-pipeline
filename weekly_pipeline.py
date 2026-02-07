@@ -14,6 +14,7 @@ Usage:
 
 import argparse
 import csv
+import json
 import os
 import shutil
 import subprocess
@@ -34,6 +35,8 @@ WEEKLY_LOGS_DIR = os.path.join(DATA_DIR, "weekly_logs")
 PROPERTY_MANAGERS_CSV = os.path.join(DATA_DIR, "property_managers.csv")
 DOMAINS_DOORS_CSV = os.path.join(DATA_DIR, "domains_doors.csv")
 PM_RESULTS_CSV = os.path.join(DATA_DIR, "pm_results.csv")
+RBP_RESULTS_CSV = os.path.join(DATA_DIR, "rbp_results.csv")
+CUMULATIVE_STATS_JSON = os.path.join(WEEKLY_LOGS_DIR, "cumulative_stats.json")
 
 # Intermediate files (gitignored)
 NEW_DOMAINS_CSV = os.path.join(DATA_DIR, "new_domains.csv")
@@ -73,6 +76,7 @@ def read_csv(path):
     """Read a CSV file and return list of dicts."""
     if not os.path.exists(path):
         return []
+    csv.field_size_limit(sys.maxsize)
     with open(path, "r", encoding="utf-8", newline="") as f:
         return list(csv.DictReader(f))
 
@@ -299,7 +303,87 @@ def step_rbp_detection():
     rbp_results = [r for r in all_rbp if r.get("domain") in new_domain_set]
     log(f"RBP detection completed. {len(rbp_results)} results for new domains.")
 
+    # Append to cumulative rbp_results.csv
+    if rbp_results:
+        rbp_fieldnames = list(rbp_results[0].keys())
+        file_exists = os.path.exists(RBP_RESULTS_CSV)
+        with open(RBP_RESULTS_CSV, "a", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=rbp_fieldnames)
+            if not file_exists:
+                writer.writeheader()
+            for row in rbp_results:
+                writer.writerow(row)
+        log(f"Appended {len(rbp_results)} results to cumulative {RBP_RESULTS_CSV}")
+
     return rbp_results
+
+
+def compute_rbp_stats(rbp_rows):
+    """Compute RBP statistics from a list of RBP result dicts."""
+    total = len(rbp_rows)
+    offered = 0
+    vendors = Counter()
+    categories = Counter()
+    by_pm_system = Counter()  # pm_system -> rbp_offered count
+
+    for r in rbp_rows:
+        is_offered = str(r.get("rbp_offered", "0")) == "1"
+        if is_offered:
+            offered += 1
+            pm = r.get("pm_system", "unknown") or "unknown"
+            by_pm_system[pm] += 1
+
+        known = r.get("known_vendors", "").strip()
+        if known:
+            for vendor in known.split(";"):
+                v = vendor.strip()
+                if v:
+                    vendors[v] += 1
+
+        cats = r.get("vendors_by_category", "").strip()
+        if cats:
+            for entry in cats.split(";"):
+                cat = entry.split(":")[0].strip() if ":" in entry else entry.strip()
+                if cat:
+                    categories[cat] += 1
+
+    return {
+        "total_scanned": total,
+        "rbp_offered": offered,
+        "rbp_rate": round(100 * offered / total, 1) if total else 0,
+        "vendors": dict(vendors.most_common()),
+        "categories": dict(categories.most_common()),
+        "rbp_by_pm_system": dict(by_pm_system.most_common()),
+    }
+
+
+def load_previous_stats():
+    """Load the previous week's cumulative stats for delta comparison."""
+    if not os.path.exists(CUMULATIVE_STATS_JSON):
+        return None
+    with open(CUMULATIVE_STATS_JSON, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_cumulative_stats(stats, week):
+    """Save this week's cumulative stats for next week's comparison."""
+    stats["week"] = week
+    os.makedirs(WEEKLY_LOGS_DIR, exist_ok=True)
+    with open(CUMULATIVE_STATS_JSON, "w", encoding="utf-8") as f:
+        json.dump(stats, f, indent=2)
+
+
+def fmt_delta(current, previous, is_pct=False):
+    """Format a value with its week-on-week delta."""
+    if previous is None:
+        return str(current)
+    diff = current - previous
+    if diff == 0:
+        return f"{current} (unchanged)"
+    sign = "+" if diff > 0 else ""
+    if is_pct:
+        return f"{current}% ({sign}{diff:+.1f}pp)"
+    return f"{current} ({sign}{diff})"
 
 
 def step_log(new_pms, new_domains, pm_results, rbp_results):
@@ -316,7 +400,6 @@ def step_log(new_pms, new_domains, pm_results, rbp_results):
     # Build lookup tables
     pm_by_domain = {r.get("domain", ""): r for r in pm_results}
     rbp_by_domain = {r.get("domain", ""): r for r in rbp_results}
-    domain_info = {d["domain"]: d for d in new_domains}
 
     # Build combined rows
     log_fieldnames = [
@@ -346,10 +429,10 @@ def step_log(new_pms, new_domains, pm_results, rbp_results):
     write_csv(log_csv_path, log_rows, log_fieldnames)
     log(f"Wrote weekly log: {log_csv_path} ({len(log_rows)} rows)")
 
-    # Generate summary
+    # --- This Week's New PMs Summary ---
     with_website = len(new_domains)
     pm_detected = sum(1 for r in pm_results if r.get("portal_system") and r.get("portal_system") != "unknown")
-    rbp_offered = sum(1 for r in rbp_results if str(r.get("rbp_offered", "0")) == "1")
+    new_rbp_offered = sum(1 for r in rbp_results if str(r.get("rbp_offered", "0")) == "1")
 
     pm_systems = Counter()
     for r in pm_results:
@@ -359,17 +442,69 @@ def step_log(new_pms, new_domains, pm_results, rbp_results):
 
     summary_lines = [
         f"Weekly Pipeline Report: {today}",
-        "=" * 50,
+        "=" * 60,
+        "",
+        "THIS WEEK'S NEW PMs",
+        "-" * 40,
         f"New property managers found: {len(new_pms)}",
         f"  With website: {with_website}",
         f"  PM software detected: {pm_detected}",
-        f"  RBP offered: {rbp_offered}",
+        f"  RBP offered: {new_rbp_offered}",
     ]
 
     if pm_systems:
-        summary_lines.append("PM System Breakdown:")
+        summary_lines.append("  PM System Breakdown:")
         for system, count in pm_systems.most_common():
-            summary_lines.append(f"  {system}: {count}")
+            summary_lines.append(f"    {system}: {count}")
+
+    # --- Database-Wide RBP Summary ---
+    summary_lines.extend(["", ""])
+    summary_lines.append("DATABASE-WIDE RBP SUMMARY")
+    summary_lines.append("-" * 40)
+
+    all_rbp = read_csv(RBP_RESULTS_CSV)
+    prev_stats = load_previous_stats()
+    curr_stats = compute_rbp_stats(all_rbp)
+
+    prev_total = prev_stats.get("total_scanned") if prev_stats else None
+    prev_offered = prev_stats.get("rbp_offered") if prev_stats else None
+    prev_rate = prev_stats.get("rbp_rate") if prev_stats else None
+    prev_vendors = prev_stats.get("vendors", {}) if prev_stats else {}
+    prev_categories = prev_stats.get("categories", {}) if prev_stats else {}
+    prev_by_pm = prev_stats.get("rbp_by_pm_system", {}) if prev_stats else {}
+
+    summary_lines.append(f"Total domains scanned: {fmt_delta(curr_stats['total_scanned'], prev_total)}")
+    summary_lines.append(f"RBP offered: {fmt_delta(curr_stats['rbp_offered'], prev_offered)}")
+    summary_lines.append(f"RBP adoption rate: {fmt_delta(curr_stats['rbp_rate'], prev_rate, is_pct=True)}")
+
+    if curr_stats["rbp_by_pm_system"]:
+        summary_lines.append("")
+        summary_lines.append("RBP Adoption by PM System:")
+        for system, count in sorted(curr_stats["rbp_by_pm_system"].items(), key=lambda x: -x[1]):
+            prev_count = prev_by_pm.get(system)
+            summary_lines.append(f"  {system}: {fmt_delta(count, prev_count)}")
+
+    if curr_stats["categories"]:
+        summary_lines.append("")
+        summary_lines.append("Vendor Categories (domains using each):")
+        for cat, count in sorted(curr_stats["categories"].items(), key=lambda x: -x[1]):
+            prev_count = prev_categories.get(cat)
+            summary_lines.append(f"  {cat}: {fmt_delta(count, prev_count)}")
+
+    if curr_stats["vendors"]:
+        summary_lines.append("")
+        summary_lines.append("Top Vendors (domains using each):")
+        top_vendors = sorted(curr_stats["vendors"].items(), key=lambda x: -x[1])[:15]
+        for vendor, count in top_vendors:
+            prev_count = prev_vendors.get(vendor)
+            summary_lines.append(f"  {vendor}: {fmt_delta(count, prev_count)}")
+
+    if prev_stats:
+        prev_week = prev_stats.get("week", "unknown")
+        summary_lines.extend(["", f"(Deltas vs. previous week: {prev_week})"])
+
+    # Save current stats for next week
+    save_cumulative_stats(curr_stats, today)
 
     summary_text = "\n".join(summary_lines) + "\n"
     with open(summary_path, "w", encoding="utf-8") as f:
