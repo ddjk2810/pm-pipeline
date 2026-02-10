@@ -1,5 +1,4 @@
 {
-  "week": "2026-02-07",
   "total_scanned": 8230,
   "rbp_offered": 378,
   "rbp_rate": 4.6,
@@ -171,5 +170,6 @@
     "propertyware": 16,
     "rentmanager": 14,
     "custom:jmsproperties.simplifyemsites.com": 1
-  }
+  },
+  "week": "2026-02-10"
 }
