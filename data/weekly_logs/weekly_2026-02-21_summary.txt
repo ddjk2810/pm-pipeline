@@ -1,0 +1,59 @@
+Daily Pipeline Report: 2026-02-21
+============================================================
+
+CHUNK RE-SCAN
+----------------------------------------
+Chunk: 7/8
+Domains re-scanned: 1029
+DNS recovered: 13
+Rotation complete: No
+
+
+DATABASE-WIDE RBP SUMMARY
+----------------------------------------
+Total domains scanned: 8230 (unchanged)
+RBP offered: 378 (unchanged)
+RBP adoption rate: 4.6 (unchanged)
+
+RBP Adoption by PM System:
+  appfolio: 233 (unchanged)
+  rentvine: 53 (unchanged)
+  buildium: 36 (unchanged)
+  yardi: 25 (unchanged)
+  propertyware: 16 (unchanged)
+  rentmanager: 14 (unchanged)
+  custom:jmsproperties.simplifyemsites.com: 1 (unchanged)
+
+Vendor Categories (domains using each):
+  pet_services: 464 (unchanged)
+  maintenance: 304 (unchanged)
+  utility_concierge: 170 (unchanged)
+  rbp_provider: 100 (unchanged)
+  reviews_reputation: 62 (unchanged)
+  showing_scheduling: 58 (unchanged)
+  deposit_alternative: 56 (unchanged)
+  renters_insurance: 55 (unchanged)
+  credit_reporting: 50 (unchanged)
+  screening_payments: 40 (unchanged)
+  rewards: 18 (unchanged)
+  community_platform: 12 (unchanged)
+  air_filter: 6 (unchanged)
+
+Top Vendors (domains using each):
+  property_meld: 172 (unchanged)
+  pet_screening: 142 (unchanged)
+  ourpetpolicy: 91 (unchanged)
+  moved: 38 (unchanged)
+  showmojo: 38 (unchanged)
+  fourandhalf: 37 (unchanged)
+  ourpetpolicy, utility_concierge: 35 (unchanged)
+  second_nature: 28 (unchanged)
+  boompay: 27 (unchanged)
+  utility_concierge: 24 (unchanged)
+  pet_screening, property_meld: 21 (unchanged)
+  ourpetpolicy, second_nature: 18 (unchanged)
+  ourpetpolicy, property_meld: 17 (unchanged)
+  boom: 16 (unchanged)
+  pet_screening, second_nature: 16 (unchanged)
+
+(Deltas vs. previous run: 2026-02-20)
